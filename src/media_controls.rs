@@ -19,7 +19,7 @@ use std::{
     cell::RefCell,
     fs,
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         mpsc::{self, Receiver, Sender},
@@ -80,14 +80,15 @@ impl MediaHandle {
 }
 
 /// Creates the handle for the main loop and the closure that owns the main thread.
-pub(crate) fn new() -> (MediaHandle, impl FnOnce() -> eyre::Result<()>) {
+/// `device_name` labels the Now Playing tile while nothing is playing here.
+pub(crate) fn new(device_name: String) -> (MediaHandle, impl FnOnce() -> eyre::Result<()>) {
     let (tx, rx) = mpsc::channel();
     let spirc = Arc::new(Mutex::new(None));
     let handle = MediaHandle {
         events: tx,
         spirc: spirc.clone(),
     };
-    (handle, move || run_main_thread(rx, spirc))
+    (handle, move || run_main_thread(rx, spirc, device_name))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -155,10 +156,9 @@ impl State {
                 self.set_position(position_ms);
                 true
             }
-            // The last item is kept so the widget keeps showing it while idle (the JSON file
-            // omits track fields when stopped, see `to_json`).
             PlayerEvent::Stopped { .. } => {
                 self.status = Some(Status::Stopped);
+                self.item = None;
                 self.set_position(0);
                 true
             }
@@ -175,6 +175,7 @@ impl State {
             PlayerEvent::SessionDisconnected { .. } => {
                 self.active = false;
                 self.status = Some(Status::Stopped);
+                self.item = None;
                 self.set_position(0);
                 true
             }
@@ -215,10 +216,8 @@ impl State {
         match self.status() {
             Status::Playing => MediaPlayback::Playing { progress },
             Status::Paused => MediaPlayback::Paused { progress },
-            // Reporting `Stopped` would drop us as the system's "Now Playing app", and with it
-            // the media keys. Staying `Paused` keeps a play press routed here so it can take
-            // playback over.
-            Status::Stopped => MediaPlayback::Paused { progress: None },
+            // Media keys keep arriving while stopped, so playing from here still takes over.
+            Status::Stopped => MediaPlayback::Stopped,
         }
     }
 
@@ -251,10 +250,15 @@ impl State {
 // ---------------------------------------------------------------------------------------------
 // Main thread: AppKit run loop, Now Playing, media keys, the file.
 
+/// Artwork for the idle tile (a music note on a dark square); macOS needs it as a file.
+const IDLE_ARTWORK: &[u8] = include_bytes!("media_controls/idle_artwork.png");
+
 struct Context {
     controls: MediaControls,
     state: State,
     file: PathBuf,
+    device_name: String,
+    idle_artwork_url: Option<String>,
 }
 
 thread_local! {
@@ -278,7 +282,23 @@ impl Context {
         let state = &self.state;
         let artists = state.artists().join(", ");
         let album = state.album();
-        let metadata = match state.item.as_deref() {
+        let item = state
+            .item
+            .as_deref()
+            .filter(|_| state.status() != Status::Stopped);
+        debug!(
+            "now playing: {:?} {:?}",
+            state.status(),
+            item.map(|i| &i.name)
+        );
+        if let Err(err) = self.controls.set_playback(state.playback()) {
+            warn!("failed to update Now Playing playback state: {err:?}");
+        }
+        // While stopped (nothing played yet, or another device took playback over) the tile
+        // stays: macOS keeps every process that registered media-key handlers in Now Playing,
+        // and those handlers are what lets a play press take playback back. Without metadata
+        // it would show the process name, so label it instead.
+        let metadata = match item {
             Some(item) => MediaMetadata {
                 title: Some(item.name.as_str()),
                 artist: Some(artists.as_str()),
@@ -286,18 +306,15 @@ impl Context {
                 cover_url: state.cover_url(),
                 duration: Some(Duration::from_millis(item.duration_ms.into())),
             },
-            // Nothing played yet: show who we are so the widget isn't a blank tile.
             None => MediaMetadata {
-                title: Some("spotifyd"),
-                artist: Some("Not playing"),
+                title: Some("Not playing"),
+                artist: Some(self.device_name.as_str()),
+                cover_url: self.idle_artwork_url.as_deref(),
                 ..MediaMetadata::default()
             },
         };
         if let Err(err) = self.controls.set_metadata(metadata) {
             warn!("failed to update Now Playing metadata: {err:?}");
-        }
-        if let Err(err) = self.controls.set_playback(state.playback()) {
-            warn!("failed to update Now Playing playback state: {err:?}");
         }
         if let Err(err) = write_atomically(&self.file, &state.to_json()) {
             warn!("failed to write {}: {err}", self.file.display());
@@ -305,7 +322,20 @@ impl Context {
     }
 }
 
-fn write_atomically(path: &PathBuf, json: &serde_json::Value) -> eyre::Result<()> {
+/// Puts the idle artwork next to the now-playing file and returns its `file://` URL.
+fn write_idle_artwork(now_playing_file: &Path) -> eyre::Result<String> {
+    let dir = now_playing_file
+        .parent()
+        .ok_or_else(|| eyre::eyre!("now-playing file has no parent directory"))?;
+    fs::create_dir_all(dir)?;
+    let path = dir.join("idle_artwork.png");
+    if fs::read(&path).ok().as_deref() != Some(IDLE_ARTWORK) {
+        fs::write(&path, IDLE_ARTWORK)?;
+    }
+    Ok(format!("file://{}", path.display()))
+}
+
+fn write_atomically(path: &Path, json: &serde_json::Value) -> eyre::Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
@@ -369,6 +399,7 @@ fn handle_media_event(spirc: &Mutex<Option<Arc<Spirc>>>, event: MediaControlEven
 fn run_main_thread(
     events: Receiver<PlayerEvent>,
     spirc: Arc<Mutex<Option<Arc<Spirc>>>>,
+    device_name: String,
 ) -> eyre::Result<()> {
     let mtm = MainThreadMarker::new()
         .ok_or_else(|| eyre::eyre!("media controls must be started on the main thread"))?;
@@ -395,11 +426,16 @@ fn run_main_thread(
         "media controls enabled; now-playing file at {}",
         file.display()
     );
+    let idle_artwork_url = write_idle_artwork(&file)
+        .map_err(|err| warn!("no idle artwork: {err}"))
+        .ok();
     CONTEXT.with(|ctx| {
         *ctx.borrow_mut() = Some(Context {
             controls,
             state: State::default(),
             file,
+            device_name,
+            idle_artwork_url,
         })
     });
     with_context(|ctx| ctx.publish());

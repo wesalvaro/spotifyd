@@ -228,7 +228,7 @@ fn run_daemon(mut cli_config: CliConfig) -> eyre::Result<()> {
     #[cfg(all(target_os = "macos", feature = "macos_media_controls"))]
     if media_controls::enabled() {
         // Apple's media APIs want the main thread's run loop, so tokio moves to a worker.
-        let (media, run_media) = media_controls::new();
+        let (media, run_media) = media_controls::new(internal_config.device_name.clone());
         let worker = std::thread::Builder::new()
             .name("spotifyd".into())
             .spawn(move || {
