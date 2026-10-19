@@ -22,6 +22,8 @@ mod config;
 mod dbus_mpris;
 mod error;
 mod main_loop;
+#[cfg(all(target_os = "macos", feature = "macos_media_controls"))]
+mod media_controls;
 mod no_mixer;
 mod oauth;
 mod process;
@@ -221,6 +223,24 @@ fn run_daemon(mut cli_config: CliConfig) -> eyre::Result<()> {
         } else {
             pledge("stdio rpath wpath cpath inet mcast unix dns audio", None).unwrap();
         }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "macos_media_controls"))]
+    if media_controls::enabled() {
+        // Apple's media APIs want the main thread's run loop, so tokio moves to a worker.
+        let (media, run_media) = media_controls::new();
+        let worker = std::thread::Builder::new()
+            .name("spotifyd".into())
+            .spawn(move || {
+                Runtime::new().unwrap().block_on(async {
+                    let mut initial_state = setup::initial_state(internal_config)?;
+                    initial_state.media = Some(media);
+                    initial_state.run().await
+                })
+            })
+            .wrap_err("Couldn't spawn main loop thread")?;
+        run_media()?;
+        return worker.join().expect("main loop thread panicked");
     }
 
     let runtime = Runtime::new().unwrap();

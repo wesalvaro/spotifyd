@@ -162,5 +162,7 @@ pub(crate) fn initial_state(
         player_event_program: config.onevent,
         #[cfg(feature = "dbus_mpris")]
         mpris_config: config.mpris,
+        #[cfg(all(target_os = "macos", feature = "macos_media_controls"))]
+        media: None,
     })
 }

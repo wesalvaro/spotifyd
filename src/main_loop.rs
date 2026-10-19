@@ -89,6 +89,8 @@ pub(crate) struct MainLoop {
     pub(crate) credentials_provider: CredentialsProvider,
     #[cfg(feature = "dbus_mpris")]
     pub(crate) mpris_config: MprisConfig,
+    #[cfg(all(target_os = "macos", feature = "macos_media_controls"))]
+    pub(crate) media: Option<crate::media_controls::MediaHandle>,
 }
 
 struct ConnectionInfo<SpircTask: Future<Output = ()>> {
@@ -198,6 +200,11 @@ impl MainLoop {
 
             let shared_spirc = Arc::new(connection.spirc);
 
+            #[cfg(all(target_os = "macos", feature = "macos_media_controls"))]
+            if let Some(media) = &self.media {
+                media.set_spirc(Some(shared_spirc.clone()));
+            }
+
             #[cfg(feature = "dbus_mpris")]
             if let Either::Left(mut dbus_server) = Either::as_pin_mut(dbus_server.as_mut())
                 && let Err(err) = dbus_server
@@ -250,6 +257,10 @@ impl MainLoop {
                         if let Some(ref tx) = mpris_event_tx {
                             tx.send(event.clone()).unwrap();
                         }
+                        #[cfg(all(target_os = "macos", feature = "macos_media_controls"))]
+                        if let Some(media) = &self.media {
+                            media.on_event(&event);
+                        }
                         if let Some(ref cmd) = self.player_event_program {
                             match spawn_program_on_event(&self.shell, cmd, event) {
                                 Ok(child) => running_event_program = Box::pin(child.wait().fuse()),
@@ -267,6 +278,10 @@ impl MainLoop {
                         }
                     }
                 )
+            }
+            #[cfg(all(target_os = "macos", feature = "macos_media_controls"))]
+            if let Some(media) = &self.media {
+                media.set_spirc(None);
             }
             #[cfg(feature = "dbus_mpris")]
             if let Either::Left(dbus_server) = Either::as_pin_mut(dbus_server.as_mut())
