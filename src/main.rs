@@ -21,6 +21,8 @@ mod config;
 #[cfg(feature = "dbus_mpris")]
 mod dbus_mpris;
 mod error;
+#[cfg(target_os = "macos")]
+mod macos_audio;
 mod main_loop;
 #[cfg(all(target_os = "macos", feature = "macos_media_controls"))]
 mod media_controls;
